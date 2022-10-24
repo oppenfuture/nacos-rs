@@ -1,13 +1,14 @@
 use bytes::Bytes;
 use md5::{Digest, Md5};
 use reqwest::{Client, Error};
-use std::collections::HashMap;
+use std::{collections::HashMap, net::SocketAddr};
 use tokio::sync::Mutex;
 
 /// A `Nacos` service without authentication.
 pub struct Nacos {
-    server_addr: String,
-    namespace: String,
+    use_https: bool,
+    server_addr: SocketAddr,
+    namespace: Option<String>,
     group: String,
     /// Data id to md5.
     current_config: Mutex<HashMap<String, String>>,
@@ -15,8 +16,14 @@ pub struct Nacos {
 }
 
 impl Nacos {
-    pub fn new(server_addr: String, namespace: String, group: String) -> Self {
+    pub fn new(
+        use_https: bool,
+        server_addr: SocketAddr,
+        namespace: Option<String>,
+        group: String,
+    ) -> Self {
         Self {
+            use_https,
             server_addr,
             namespace,
             group,
@@ -30,7 +37,7 @@ impl Nacos {
             // New config that we never saw. Get it from server.
             let config = self.get_config(data_id).await?;
             self.update_md5(data_id, &config).await;
-            return Ok(config);
+            Ok(config)
         } else {
             loop {
                 let md5 = self
@@ -45,11 +52,13 @@ impl Nacos {
                 listening_configs.push_str(&self.group);
                 listening_configs.push(2 as char);
                 listening_configs.push_str(&md5);
-                listening_configs.push(2 as char);
-                listening_configs.push_str(&self.namespace);
+                if let Some(namespace) = &self.namespace {
+                    listening_configs.push(2 as char);
+                    listening_configs.push_str(namespace);
+                }
                 listening_configs.push(1 as char);
 
-                let url = format!("{}/nacos/v1/cs/configs/listener", self.server_addr);
+                let url = self.make_url("/nacos/v1/cs/configs/listener");
                 let request = self.client.post(url);
                 let request = request.header("Long-Pulling-Timeout", "30000");
                 let request = request.query(&[("Listening-Configs", &listening_configs)]);
@@ -69,17 +78,25 @@ impl Nacos {
 }
 
 impl Nacos {
+    fn make_url(&self, path: &str) -> String {
+        format!(
+            "{}://{}{}",
+            if self.use_https { "https" } else { "http" },
+            self.server_addr,
+            path
+        )
+    }
+
     async fn get_config(&self, data_id: &str) -> Result<Bytes, Error> {
-        let url = format!("{}/nacos/v1/cs/configs", self.server_addr);
-        let request = self.client.get(url);
-        let request = request.query(&[
-            ("tenant", self.namespace.as_str()),
-            ("group", self.group.as_str()),
-            ("dataId", data_id),
-        ]);
+        let url = self.make_url("/nacos/v1/cs/configs");
+        let mut request = self.client.get(url);
+        if let Some(namespace) = &self.namespace {
+            request = request.query(&[("tenant", namespace.as_str())]);
+        }
+        request = request.query(&[("group", self.group.as_str()), ("dataId", data_id)]);
         let response = request.send().await?;
         let response = response.error_for_status()?;
-        Ok(response.bytes().await?)
+        response.bytes().await
     }
 
     async fn update_md5(&self, data_id: &str, config: &Bytes) {
@@ -94,18 +111,26 @@ impl Nacos {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
 
-    #[tokio::test]
-    async fn it_works() {
+    async fn test(namespace: Option<String>) {
         let nacos = Nacos::new(
-            "http://192.168.10.252:8848".into(),
-            "8b0a9030-215e-45f3-9cc2-b53c93229909".into(),
+            false,
+            SocketAddr::from_str("192.168.10.252:8848").unwrap(),
+            namespace,
             "DEFAULT_GROUP".into(),
         );
         let data_id = "com.oppentech.ysl-custom-design.renderer";
         let bytes = nacos.wait_for_new_config(data_id).await.unwrap();
         println!("{}", std::str::from_utf8(&bytes).unwrap());
         nacos.wait_for_new_config(data_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn it_works() {
+        test(None).await;
+        test(Some("8b0a9030-215e-45f3-9cc2-b53c93229909".into())).await;
     }
 }
